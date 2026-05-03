@@ -103,14 +103,19 @@ async function processBook(filePath) {
     for (let i = 0; i < chunks.length; i += 10) {
         const batchChunks = chunks.slice(i, i + 10);
         try {
-            const response = await ai.models.embedContent({
-                model: 'text-embedding-004',
-                contents: batchChunks
+            const batchPromises = batchChunks.map(async (text) => {
+               const response = await ai.models.embedContent({
+                 model: 'gemini-embedding-2',
+                 contents: text,
+                 config: { outputDimensionality: 768 }
+               });
+               return response.embeddings[0].values;
             });
+            const embeddings = await Promise.all(batchPromises);
 
-            const vectors = response.embeddings.map((emb, idx) => ({
+            const vectors = embeddings.map((embValues, idx) => ({
                 id: `${sourceName}-chunk-${i + idx}`,
-                values: emb.values,
+                values: embValues,
                 metadata: {
                     source: sourceName,
                     topic: topic,
