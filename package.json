@@ -8,7 +8,7 @@
     "sync": "node sync.js"
   },
   "dependencies": {
-    "@google/genai": "latest",
+    "@google/genai": "^1.17.0",
     "@pinecone-database/pinecone": "^4.0.0",
     "cheerio": "^1.0.0-rc.12",
     "dotenv": "^16.4.5"
