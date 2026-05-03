@@ -8,10 +8,10 @@ dotenv.config();
 
 // 1. إعداد الروابط والمفاتيح
 const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY1; // تم ضبطه كما سميته
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY1; // مفتاح جيميناي كما أسميته
 
 if (!PINECONE_API_KEY || !GEMINI_API_KEY) {
-    console.error("Missing API Keys: يرجى التأكد من إضافة أسرار Github.");
+    console.error("Missing API Keys: يرجى التأكد من إعداد Secrets في Github.");
     process.exit(1);
 }
 
@@ -34,7 +34,7 @@ console.log("الملفات المطلوب حذفها:", filesToDelete);
 function parseContent(filePath, content) {
     if (filePath.endsWith('.htm') || filePath.endsWith('.html')) {
         const $ = cheerio.load(content);
-        return $.text().replace(/\s+/g, ' ').trim(); // إزالة التنسيقات واحتفاظ النص فقط
+        return $.text().replace(/\s+/g, ' ').trim(); // إزالة التنسيقات والاحتفاظ بالنص فقط
     }
     return content;
 }
@@ -50,11 +50,11 @@ function chunkText(text, chunkSize = 1500, overlap = 200) {
     return chunks;
 }
 
-// معالجة حذف ملف
+// معالجة حذف ملف من Pinecone
 async function deleteBookVectors(filePath) {
     const parts = filePath.split('/');
     const fileName = parts[parts.length - 1];
-    const sourceName = fileName.replace(/\.[^/.]+$/, ""); // حذف الامتداد
+    const sourceName = fileName.replace(/\.[^/.]+$/, ""); // حذف الامتداد (txt, htm)
 
     console.log(`جاري حـذف الكتاب: ${sourceName} من Pinecone...`);
     try {
@@ -65,14 +65,28 @@ async function deleteBookVectors(filePath) {
     }
 }
 
+// دالة لجلب المتجهات (Embeddings) لكل جزء باستخدام نفس دالة بحث التطبيق
+async function getEmbedding(text) {
+    const response = await ai.models.embedContent({
+        model: "text-embedding-004", 
+        contents: text,
+        config: { outputDimensionality: 768 }
+    });
+    if (!response.embeddings || !response.embeddings[0]?.values) {
+        throw new Error("No embeddings returned from Gemini API");
+    }
+    return response.embeddings[0].values;
+}
+
 // معالجة رفع/تعديل ملف
 async function processBook(filePath) {
     const parts = filePath.split('/');
-    const topicFolder = parts.length > 1 ? parts[1].toLowerCase() : 'aqeedah';
+    // تحديد مجلد التخصص (إذا كان موجوداً داخل مجلد books)
+    const topicFolder = parts.length > 2 ? parts[1].toLowerCase() : 'aqeedah';
     const fileName = parts[parts.length - 1];
     const sourceName = fileName.replace(/\.[^/.]+$/, "");
 
-    // تحويل المجلد لاسم التخصص بالعربي ليخزن في Pinecone
+    // تحويل اسم المجلد لاسم التخصص بالعربي ليُخزن في خصائص Pinecone
     const topicMap = {
         'aqeedah': 'عقيدة',
         'tafsir': 'تفسير',
@@ -85,11 +99,11 @@ async function processBook(filePath) {
 
     console.log(`جاري معالجة الكـتـاب >> ${sourceName} | التخصص >> ${topic}`);
 
-    // حذف المتجهات السابقة لهذا الكتاب (لتفادي التكرار عند التعديل)
+    // نحذف المتجهات السابقة لهذا الكتاب (لتفادي التكرار عند التعديل)
     await deleteBookVectors(filePath);
 
     if (!fs.existsSync(filePath)) {
-        console.log(`الملف غير موجود محلياً (قد يكون تم حذفه): ${filePath}`);
+        console.log(`الملف غير موجود محلياً (قد يكون تم حذفه مسبقا): ${filePath}`);
         return;
     }
 
@@ -99,27 +113,26 @@ async function processBook(filePath) {
 
     console.log(`تم تقسيم الكتاب لـ: ${chunks.length} جزء (Chunk)`);
 
-    // دفع المتجهات (Batches) لمراعاة نظام التسعير والآداء للذكاء
+    // دفع المتجهات (Batches بمقدار 10) تفادياً لحدود السرعة والضغط
     for (let i = 0; i < chunks.length; i += 10) {
         const batchChunks = chunks.slice(i, i + 10);
         try {
-            const response = await ai.models.embedContent({
-                model: 'text-embedding-004',
-                contents: batchChunks.map(text => ({ parts: [{ text }] }))
+            const batchPromises = batchChunks.map(async (text, idx) => {
+                const values = await getEmbedding(text);
+                return {
+                    id: `${sourceName}-chunk-${i + idx}`,
+                    values: values,
+                    metadata: {
+                        source: sourceName,
+                        topic: topic,
+                        text: text
+                    }
+                };
             });
-
-            const vectors = response.embeddings.map((emb, idx) => ({
-                id: `${sourceName}-chunk-${i + idx}`,
-                values: emb.values,
-                metadata: {
-                    source: sourceName,
-                    topic: topic,
-                    text: batchChunks[idx]
-                }
-            }));
+            const vectors = await Promise.all(batchPromises);
 
             await index.upsert(vectors);
-            console.log(`تم رفع الدفعة ${i / 10 + 1} لكتاب ${sourceName}`);
+            console.log(`تم رفع الدفعة ${(i / 10) + 1} بنجاح لكتاب ${sourceName}`);
         } catch (error) {
             console.error(`خطأ أثناء رفع كتاب ${sourceName}:`, error.message);
         }
@@ -127,16 +140,16 @@ async function processBook(filePath) {
     console.log(`✅ انتهت مزامنة كتاب: ${sourceName}`);
 }
 
-// التشغيل الأساسي
+// التشغيل الأساسي للسكربت
 async function main() {
-    // 1- تنفيذ الحذف للملفات الملغاة
+    // 1- تنفيذ عملية الحذف للملفات الملغاة أولاً
     for (const file of filesToDelete) {
         if (file.startsWith('books/')) {
             await deleteBookVectors(file);
         }
     }
 
-    // 2- معالجة الجديد والمُعَدّل
+    // 2- معالجة الكتب الجديدة أو المُعدلة
     for (const file of filesToProcess) {
         if (file.startsWith('books/') && (file.endsWith('.txt') || file.endsWith('.htm') || file.endsWith('.html'))) {
             await processBook(file);
