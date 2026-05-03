@@ -1,7 +1,7 @@
 {
-  "name": "salafi-library-sync",
+  "name": "salafi-library",
   "version": "1.0.0",
-  "description": "Sync books to Pinecone automatically via GitHub Actions",
+  "description": "Salafi Library Sync Database",
   "main": "sync.js",
   "type": "module",
   "scripts": {
