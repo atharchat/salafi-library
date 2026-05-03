@@ -1,0 +1,10 @@
+{
+  "name": "books-sync",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@google/genai": "^0.1.2",
+    "@pinecone-database/pinecone": "^2.2.0",
+    "cheerio": "^1.0.0-rc.12"
+  }
+}
