@@ -1,100 +1,116 @@
 import fs from 'fs';
 import path from 'path';
-import crypto from 'crypto';
-import * as cheerio from 'cheerio';
 import { Pinecone } from '@pinecone-database/pinecone';
 import { GoogleGenAI } from '@google/genai';
+import * as cheerio from 'cheerio';
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const pc = new Pinecone({ apiKey: process.env.PINECONE_API_KEY });
-const indexName = process.env.PINECONE_INDEX_NAME || 'salafi-scholar';
-const index = pc.index(indexName);
+const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// دالة لمعالجة ورفع الكتاب
+if (!PINECONE_API_KEY || !GEMINI_API_KEY) {
+  console.error("Missing API keys! Please set them in GitHub Secrets.");
+  process.exit(1);
+}
+
+// الاتصال بقواعد البيانات
+const pc = new Pinecone({ apiKey: PINECONE_API_KEY });
+const index = pc.index("salafi-scholar"); // تأكد أن اسم الـ index مطابق لما لديك في Pinecone
+const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+// استلام الملفات المعدلة والمحذوفة من GitHub Actions (مفصولة بعلامة | لتفادي مشاكل المسافات في أسماء الملفات)
+const addedModified = process.env.ADDED_MODIFIED ? process.env.ADDED_MODIFIED.split('|').filter(Boolean) : [];
+const deleted = process.env.DELETED ? process.env.DELETED.split('|').filter(Boolean) : [];
+
+// دالة لتنظيف ملفات HTM/HTML وتحويلها لنص صافي
+function extractTextFromHtml(html) {
+  const $ = cheerio.load(html);
+  $('script, style').remove(); // إزالة أي أكواد
+  let text = $('body').text() || $.text();
+  // تنظيف المسافات الزائدة
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+// دالة تقسيم النص إلى فقرات (Chunking)
+function chunkText(text, chunkSize = 500) {
+  const words = text.split(' ');
+  const chunks = [];
+  for (let i = 0; i < words.length; i += chunkSize) {
+    chunks.push(words.slice(i, i + chunkSize).join(' '));
+  }
+  return chunks;
+}
+
+// معالجة ملف تمت إضافته أو تعديله
 async function processFile(filePath) {
   if (!fs.existsSync(filePath)) return;
-  console.log(`جارِ معالجة: ${filePath}`);
+  const fileName = path.basename(filePath, path.extname(filePath)); // اسم الكتاب بدون امتداد
+  const ext = path.extname(filePath).toLowerCase();
+  const topic = path.basename(path.dirname(filePath)); // المجلد الداخلي مثل aqeedah
+
+  console.log(`جارِ معالجة الكتاب: ${fileName}`);
+  let content = fs.readFileSync(filePath, 'utf-8');
   
-  const text = fs.readFileSync(filePath, 'utf-8');
-  // استخراج اسم الكتاب من اسم الملف (ويُفضل أن يكون اسم الملف هو اسم الكتاب لتسهيل الحذف اللاحق)
-  let bookTitle = path.basename(filePath, path.extname(filePath));
-  const topic = path.basename(path.dirname(filePath)); // مثلا: books/عقيدة/كتاب.html -> التخصص: عقيدة
-  
-  let chunks = [];
-  if (filePath.endsWith('.html')) {
-    const $ = cheerio.load(text);
-    // إذا وجدنا عنواناً بداخله نأخذه، وإلا نستخدم اسم الملف
-    bookTitle = $('title').first().text().trim() || bookTitle;
-    
-    $('.PageText').each((i, el) => {
-      const pageTextDiv = $(el);
-      const pageHead = pageTextDiv.find('.PageHead');
-      const pageNumStr = pageHead.find('.PageNumber').text().replace(/[^\d١-٩]/g, '').trim(); 
-      pageHead.remove(); 
-      
-      const pageText = pageTextDiv.text().replace(/\s+/g, ' ').trim();
-      if (pageText) {
-        chunks.push({
-          id: crypto.randomUUID(),
-          text: pageText,
-          metadata: { source: bookTitle, topic: topic, page: pageNumStr || '' }
-        });
-      }
-    });
+  if (ext === '.htm' || ext === '.html') {
+    content = extractTextFromHtml(content);
   }
 
-  if(chunks.length === 0) return;
-  console.log(`تم التقسيم إلى ${chunks.length} صفحة. جار الرفع...`);
-  
-  const batchSize = 50;
-  for (let i = 0; i < chunks.length; i += batchSize) {
-    const batch = chunks.slice(i, i + batchSize);
-    // استخراج البصمات (Embeddings)
-    const embeddingsRes = await Promise.all(batch.map(c => 
-      ai.models.embedContent({ model: "gemini-embedding-2", contents: c.text, config: { outputDimensionality: 768 } })
-    ));
+  // حذف أجزاء الكتاب القديمة أولاً في حال كان هذا تعديلاً لكتاب موجود
+  await index.deleteMany({ filter: { source: { $eq: fileName } } }).catch(() => {});
+
+  const chunks = chunkText(content);
+  console.log(`تم تقسيم الكتاب إلى ${chunks.length} جزء.`);
+
+  for (let i = 0; i < chunks.length; i++) {
+    const chunkId = `${fileName}_chunk_${i}`;
+    const textChunk = chunks[i];
     
-    const vectors = batch.map((c, idx) => ({
-      id: c.id,
-      values: embeddingsRes[idx].embeddings[0].values,
-      metadata: { text: c.text, ...c.metadata }
-    }));
-    
-    await index.upsert({ records: vectors });
-    console.log(`تم رفع الدفعة ${i + batch.length} من ${chunks.length}`);
+    try {
+      const response = await ai.models.embedContent({
+        model: 'text-embedding-004',
+        contents: textChunk,
+      });
+      const embedding = response.embeddings[0].values;
+
+      await index.upsert([{
+        id: chunkId,
+        values: embedding,
+        metadata: {
+          text: textChunk,
+          source: fileName,
+          topic: topic
+        }
+      }]);
+      console.log(`- تم رفع الجزء ${i+1}/${chunks.length}`);
+    } catch (e) {
+      console.error(`حدث خطأ أثناء رفع الجزء ${i} للكتاب ${fileName}:`, e.message);
+    }
   }
 }
 
-// دالة לחذف الكتاب
-async function removeFile(filePath) {
-  // الاعتماد على اسم الملف لحذفه من باينكون
-  const bookTitle = path.basename(filePath, path.extname(filePath));
-  console.log(`حذف صفحات كتاب: ${bookTitle}`);
+// معالجة ملف تم حذفه
+async function deleteFile(filePath) {
+  const fileName = path.basename(filePath, path.extname(filePath));
+  console.log(`جارِ حذف الكتاب من Pinecone: ${fileName}`);
   try {
-    await index.deleteMany({ filter: { source: { $eq: bookTitle } } });
+    await index.deleteMany({ filter: { source: { $eq: fileName } } });
     console.log(`تم الحذف بنجاح.`);
-  } catch (error) {
-    console.error("حدث خطأ أثناء الحذف:", error);
+  } catch (e) {
+    console.warn(`فشل الحذف:`, e.message);
   }
 }
 
-// الدالة الأساسية التي تستلم أسماء الملفات التي تغيرت عبر Github
-async function run() {
-  const added = (process.env.ADDED_FILES || '').split(' ').filter(Boolean);
-  const modified = (process.env.MODIFIED_FILES || '').split(' ').filter(Boolean);
-  const deleted = (process.env.DELETED_FILES || '').split(' ').filter(Boolean);
+// الدالة الرئيسية
+async function main() {
+  console.log("الملفات المضافة:", addedModified);
+  console.log("الملفات المحذوفة:", deleted);
 
-  // 1. معالجة المحذوف
-  for (const f of deleted) await removeFile(f);
-  
-  // 2. معالجة المُعدل (نحذفه القديم ثم نرفعه من جديد)
-  for (const f of modified) {
-    await removeFile(f); 
-    await processFile(f);
+  for (const file of deleted) {
+    if (file && file.startsWith('books/')) await deleteFile(file);
   }
-  
-  // 3. معالجة المُضاف حديثاً
-  for (const f of added) await processFile(f);
+
+  for (const file of addedModified) {
+    if (file && file.startsWith('books/')) await processFile(file);
+  }
 }
 
-run().catch(console.error);
+main().catch(console.error);
