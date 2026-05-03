@@ -1,116 +1,147 @@
 import fs from 'fs';
-import path from 'path';
+import * as cheerio from 'cheerio';
 import { Pinecone } from '@pinecone-database/pinecone';
 import { GoogleGenAI } from '@google/genai';
-import * as cheerio from 'cheerio';
+import dotenv from 'dotenv';
 
+dotenv.config();
+
+// 1. إعداد الروابط والمفاتيح
 const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY1; // تم ضبطه كما سميته
 
 if (!PINECONE_API_KEY || !GEMINI_API_KEY) {
-  console.error("Missing API keys! Please set them in GitHub Secrets.");
-  process.exit(1);
+    console.error("Missing API Keys: يرجى التأكد من إضافة أسرار Github.");
+    process.exit(1);
 }
 
-// الاتصال بقواعد البيانات
 const pc = new Pinecone({ apiKey: PINECONE_API_KEY });
-const index = pc.index("salafi-scholar"); // تأكد أن اسم الـ index مطابق لما لديك في Pinecone
+const index = pc.index("salafi-scholar");
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
-// استلام الملفات المعدلة والمحذوفة من GitHub Actions (مفصولة بعلامة | لتفادي مشاكل المسافات في أسماء الملفات)
-const addedModified = process.env.ADDED_MODIFIED ? process.env.ADDED_MODIFIED.split('|').filter(Boolean) : [];
-const deleted = process.env.DELETED ? process.env.DELETED.split('|').filter(Boolean) : [];
+// استخراج الملفات عبر Action
+const addedFiles = process.env.ADDED_FILES ? process.env.ADDED_FILES.split(' ') : [];
+const modifiedFiles = process.env.MODIFIED_FILES ? process.env.MODIFIED_FILES.split(' ') : [];
+const deletedFiles = process.env.DELETED_FILES ? process.env.DELETED_FILES.split(' ') : [];
 
-// دالة لتنظيف ملفات HTM/HTML وتحويلها لنص صافي
-function extractTextFromHtml(html) {
-  const $ = cheerio.load(html);
-  $('script, style').remove(); // إزالة أي أكواد
-  let text = $('body').text() || $.text();
-  // تنظيف المسافات الزائدة
-  return text.replace(/\s+/g, ' ').trim();
-}
+const filesToProcess = [...addedFiles, ...modifiedFiles].filter(f => f.trim() !== '');
+const filesToDelete = deletedFiles.filter(f => f.trim() !== '');
 
-// دالة تقسيم النص إلى فقرات (Chunking)
-function chunkText(text, chunkSize = 500) {
-  const words = text.split(' ');
-  const chunks = [];
-  for (let i = 0; i < words.length; i += chunkSize) {
-    chunks.push(words.slice(i, i + chunkSize).join(' '));
-  }
-  return chunks;
-}
+console.log("الملفات المطلوب مزامنتها:", filesToProcess);
+console.log("الملفات المطلوب حذفها:", filesToDelete);
 
-// معالجة ملف تمت إضافته أو تعديله
-async function processFile(filePath) {
-  if (!fs.existsSync(filePath)) return;
-  const fileName = path.basename(filePath, path.extname(filePath)); // اسم الكتاب بدون امتداد
-  const ext = path.extname(filePath).toLowerCase();
-  const topic = path.basename(path.dirname(filePath)); // المجلد الداخلي مثل aqeedah
-
-  console.log(`جارِ معالجة الكتاب: ${fileName}`);
-  let content = fs.readFileSync(filePath, 'utf-8');
-  
-  if (ext === '.htm' || ext === '.html') {
-    content = extractTextFromHtml(content);
-  }
-
-  // حذف أجزاء الكتاب القديمة أولاً في حال كان هذا تعديلاً لكتاب موجود
-  await index.deleteMany({ filter: { source: { $eq: fileName } } }).catch(() => {});
-
-  const chunks = chunkText(content);
-  console.log(`تم تقسيم الكتاب إلى ${chunks.length} جزء.`);
-
-  for (let i = 0; i < chunks.length; i++) {
-    const chunkId = `${fileName}_chunk_${i}`;
-    const textChunk = chunks[i];
-    
-    try {
-      const response = await ai.models.embedContent({
-        model: 'text-embedding-004',
-        contents: textChunk,
-      });
-      const embedding = response.embeddings[0].values;
-
-      await index.upsert([{
-        id: chunkId,
-        values: embedding,
-        metadata: {
-          text: textChunk,
-          source: fileName,
-          topic: topic
-        }
-      }]);
-      console.log(`- تم رفع الجزء ${i+1}/${chunks.length}`);
-    } catch (e) {
-      console.error(`حدث خطأ أثناء رفع الجزء ${i} للكتاب ${fileName}:`, e.message);
+// دالة لتنظيف ملفات HTM و HTML
+function parseContent(filePath, content) {
+    if (filePath.endsWith('.htm') || filePath.endsWith('.html')) {
+        const $ = cheerio.load(content);
+        return $.text().replace(/\s+/g, ' ').trim(); // إزالة التنسيقات واحتفاظ النص فقط
     }
-  }
+    return content;
 }
 
-// معالجة ملف تم حذفه
-async function deleteFile(filePath) {
-  const fileName = path.basename(filePath, path.extname(filePath));
-  console.log(`جارِ حذف الكتاب من Pinecone: ${fileName}`);
-  try {
-    await index.deleteMany({ filter: { source: { $eq: fileName } } });
-    console.log(`تم الحذف بنجاح.`);
-  } catch (e) {
-    console.warn(`فشل الحذف:`, e.message);
-  }
+// دالة تقسيم النص
+function chunkText(text, chunkSize = 1500, overlap = 200) {
+    const chunks = [];
+    let i = 0;
+    while (i < text.length) {
+        chunks.push(text.slice(i, i + chunkSize));
+        i += chunkSize - overlap;
+    }
+    return chunks;
 }
 
-// الدالة الرئيسية
+// معالجة حذف ملف
+async function deleteBookVectors(filePath) {
+    const parts = filePath.split('/');
+    const fileName = parts[parts.length - 1];
+    const sourceName = fileName.replace(/\.[^/.]+$/, ""); // حذف الامتداد
+
+    console.log(`جاري حـذف الكتاب: ${sourceName} من Pinecone...`);
+    try {
+        await index.deleteMany({ filter: { source: { $eq: sourceName } } });
+        console.log(`تم الحذف بنجاح: ${sourceName}`);
+    } catch (error) {
+        console.log(`لم يتم العثور على أجزاء لحذفها، أو حدث خطأ: ${sourceName}`, error.message);
+    }
+}
+
+// معالجة رفع/تعديل ملف
+async function processBook(filePath) {
+    const parts = filePath.split('/');
+    const topicFolder = parts.length > 1 ? parts[1].toLowerCase() : 'aqeedah';
+    const fileName = parts[parts.length - 1];
+    const sourceName = fileName.replace(/\.[^/.]+$/, "");
+
+    // تحويل المجلد لاسم التخصص بالعربي ليخزن في Pinecone
+    const topicMap = {
+        'aqeedah': 'عقيدة',
+        'tafsir': 'تفسير',
+        'hadith': 'حديث',
+        'fiqh': 'فقه',
+        'seerah': 'سيرة وتراجم',
+        'history': 'تاريخ'
+    };
+    const topic = topicMap[topicFolder] || 'عقيدة';
+
+    console.log(`جاري معالجة الكـتـاب >> ${sourceName} | التخصص >> ${topic}`);
+
+    // حذف المتجهات السابقة لهذا الكتاب (لتفادي التكرار عند التعديل)
+    await deleteBookVectors(filePath);
+
+    if (!fs.existsSync(filePath)) {
+        console.log(`الملف غير موجود محلياً (قد يكون تم حذفه): ${filePath}`);
+        return;
+    }
+
+    const rawContent = fs.readFileSync(filePath, 'utf8');
+    const textContent = parseContent(filePath, rawContent);
+    const chunks = chunkText(textContent);
+
+    console.log(`تم تقسيم الكتاب لـ: ${chunks.length} جزء (Chunk)`);
+
+    // دفع المتجهات (Batches) لمراعاة نظام التسعير والآداء للذكاء
+    for (let i = 0; i < chunks.length; i += 10) {
+        const batchChunks = chunks.slice(i, i + 10);
+        try {
+            const response = await ai.models.embedContent({
+                model: 'text-embedding-004',
+                contents: batchChunks.map(text => ({ parts: [{ text }] }))
+            });
+
+            const vectors = response.embeddings.map((emb, idx) => ({
+                id: `${sourceName}-chunk-${i + idx}`,
+                values: emb.values,
+                metadata: {
+                    source: sourceName,
+                    topic: topic,
+                    text: batchChunks[idx]
+                }
+            }));
+
+            await index.upsert(vectors);
+            console.log(`تم رفع الدفعة ${i / 10 + 1} لكتاب ${sourceName}`);
+        } catch (error) {
+            console.error(`خطأ أثناء رفع كتاب ${sourceName}:`, error.message);
+        }
+    }
+    console.log(`✅ انتهت مزامنة كتاب: ${sourceName}`);
+}
+
+// التشغيل الأساسي
 async function main() {
-  console.log("الملفات المضافة:", addedModified);
-  console.log("الملفات المحذوفة:", deleted);
+    // 1- تنفيذ الحذف للملفات الملغاة
+    for (const file of filesToDelete) {
+        if (file.startsWith('books/')) {
+            await deleteBookVectors(file);
+        }
+    }
 
-  for (const file of deleted) {
-    if (file && file.startsWith('books/')) await deleteFile(file);
-  }
-
-  for (const file of addedModified) {
-    if (file && file.startsWith('books/')) await processFile(file);
-  }
+    // 2- معالجة الجديد والمُعَدّل
+    for (const file of filesToProcess) {
+        if (file.startsWith('books/') && (file.endsWith('.txt') || file.endsWith('.htm') || file.endsWith('.html'))) {
+            await processBook(file);
+        }
+    }
 }
 
 main().catch(console.error);
