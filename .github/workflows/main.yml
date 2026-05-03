@@ -1,0 +1,42 @@
+name: Sync Books to Pinecone
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'books/**'  # سيتم التشغيل فقط عند إضافة/حذف كتاب من مجلد books
+
+jobs:
+  sync_to_pinecone:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: npm install
+
+      # سحب قائمة الملفات التي تم إضافتها أو حذفها أو تعديلها
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v44
+        with:
+          files: books/**
+
+      - name: Run Pinecone Sync
+        env:
+          PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PINECONE_INDEX_NAME: ${{ secrets.PINECONE_INDEX_NAME }}
+          ADDED_FILES: ${{ steps.changed-files.outputs.added_files }}
+          MODIFIED_FILES: ${{ steps.changed-files.outputs.modified_files }}
+          DELETED_FILES: ${{ steps.changed-files.outputs.deleted_files }}
+        run: node sync.js
