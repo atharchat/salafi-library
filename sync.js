@@ -3,6 +3,7 @@ import * as cheerio from 'cheerio';
 import { Pinecone } from '@pinecone-database/pinecone';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -103,15 +104,19 @@ async function processBook(filePath) {
     for (let i = 0; i < chunks.length; i += 10) {
         const batchChunks = chunks.slice(i, i + 10);
         try {
-            // المعالجة للنموذج الجديد واستخراج المتجهات بشكل متوازٍ
+            // المعالجة للنموذج واستخراج المتجهات بشكل متوازٍ
             const vectors = await Promise.all(batchChunks.map(async (text, idx) => {
                 const response = await ai.models.embedContent({
                     model: 'gemini-embedding-2',
                     contents: text,
                     config: { outputDimensionality: 768 }
                 });
+
+                // Pinecone strict ASCII requirement for vector ID
+                const vectorId = crypto.createHash('md5').update(sourceName + '-chunk-' + (i + idx)).digest('hex');
+
                 return {
-                    id: `${sourceName}-chunk-${i + idx}`,
+                    id: vectorId,
                     values: response.embeddings[0].values,
                     metadata: {
                         source: sourceName,
@@ -121,10 +126,11 @@ async function processBook(filePath) {
                 };
             }));
 
-            await index.upsert(vectors);
+            await index.upsert({ records: vectors });
             console.log(`تم رفع الدفعة ${i / 10 + 1} لكتاب ${sourceName}`);
         } catch (error) {
             console.error(`خطأ أثناء رفع كتاب ${sourceName}:`, error.message);
+            process.exitCode = 1; // رمي الخطأ ليظهر فشل العملية في الجيت هاب
         }
     }
     console.log(`✅ انتهت مزامنة كتاب: ${sourceName}`);
@@ -147,4 +153,7 @@ async function main() {
     }
 }
 
-main().catch(console.error);
+main().catch(error => {
+    console.error(error);
+    process.exit(1);
+});
