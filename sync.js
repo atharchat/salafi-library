@@ -3,13 +3,13 @@ import * as cheerio from 'cheerio';
 import { Pinecone } from '@pinecone-database/pinecone';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
-import crypto from 'crypto';
+import crypto from 'crypto'; // مكتبة مدمجة لتشفير المعرفات إلى أرقام وإنجليزي
 
 dotenv.config();
 
 // 1. إعداد الروابط والمفاتيح
 const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY1; // تم ضبطه كما سميته
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY1; 
 
 if (!PINECONE_API_KEY || !GEMINI_API_KEY) {
     console.error("Missing API Keys: يرجى التأكد من إضافة أسرار Github.");
@@ -35,7 +35,7 @@ console.log("الملفات المطلوب حذفها:", filesToDelete);
 function parseContent(filePath, content) {
     if (filePath.endsWith('.htm') || filePath.endsWith('.html')) {
         const $ = cheerio.load(content);
-        return $.text().replace(/\s+/g, ' ').trim(); // إزالة التنسيقات واحتفاظ النص فقط
+        return $.text().replace(/\s+/g, ' ').trim(); 
     }
     return content;
 }
@@ -55,7 +55,7 @@ function chunkText(text, chunkSize = 1500, overlap = 200) {
 async function deleteBookVectors(filePath) {
     const parts = filePath.split('/');
     const fileName = parts[parts.length - 1];
-    const sourceName = fileName.replace(/\.[^/.]+$/, ""); // حذف الامتداد
+    const sourceName = fileName.replace(/\.[^/.]+$/, ""); 
 
     console.log(`جاري حـذف الكتاب: ${sourceName} من Pinecone...`);
     try {
@@ -104,16 +104,18 @@ async function processBook(filePath) {
     for (let i = 0; i < chunks.length; i += 10) {
         const batchChunks = chunks.slice(i, i + 10);
         try {
-            // المعالجة للنموذج الجديد واستخراج المتجهات بشكل متوازٍ
             const vectors = await Promise.all(batchChunks.map(async (text, idx) => {
                 const response = await ai.models.embedContent({
                     model: 'gemini-embedding-2',
                     contents: text,
                     config: { outputDimensionality: 768 }
                 });
+                
+                // استخدام MD5 Hash لصناعة ID من حروف وأرقام إنجليزية فقط (يحل مشكلة الحروف العربية)
+                const vectorId = crypto.createHash('md5').update(sourceName + "-chunk-" + (i + idx)).digest('hex');
+                
                 return {
-                    // تحويل الاسم العربي المشفر باستخدام MD5 ليكون ID مكون من أحرف وأرقام إنجليزية
-                    id: crypto.createHash("md5").update(`${sourceName}-chunk-${i + idx}`).digest("hex"),
+                    id: vectorId,
                     values: response.embeddings[0].values,
                     metadata: {
                         source: sourceName,
@@ -123,9 +125,9 @@ async function processBook(filePath) {
                 };
             }));
 
-            // إصلاح دالة الـ Upsert لتتوافق مع الإصدار الحديث لـ Pinecone
+            // استخدام الصيغة الجديدة الموافقة لمكتبة ^4.0.0
             await index.upsert({ records: vectors });
-            console.log(`تم رفع الدفعة ${(i / 10) + 1} لكتاب ${sourceName}`);
+            console.log(`تم رفع الدفعة ${i / 10 + 1} لكتاب ${sourceName}`);
         } catch (error) {
             console.error(`خطأ أثناء رفع كتاب ${sourceName}:`, error.message);
         }
@@ -139,7 +141,6 @@ async function main() {
     for (const file of filesToDelete) {
         if (file.startsWith('books/')) {
             await deleteBookVectors(file);
-            console.log(`تم إنهاء عملية الحذف للملف: ${file}`);
         }
     }
 
