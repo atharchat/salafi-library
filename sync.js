@@ -11,7 +11,7 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY1;
 
 if (!PINECONE_API_KEY || !GEMINI_API_KEY) {
     console.error("Missing API Keys: يرجى التأكد من إضافة أسرار Github.");
-    process.exit(1); 
+    process.exit(1);
 }
 
 const pc = new Pinecone({ apiKey: PINECONE_API_KEY });
@@ -97,16 +97,17 @@ async function embedChunksWithRetry(chunks, batchSize = 90) {
                 }
                 
                 if (!data.embeddings || data.embeddings.length !== batch.length) {
+                    console.log('Data error context:', data);
                     throw new Error('استجابة غير متطابقة من مزود خدمة التضمين.');
                 }
                 
                 allEmbeddings.push(...data.embeddings.map(e => e.values));
                 success = true;
                 
+                // انتظار بسيط لمدة ثانيتين بين كل 90 جزء (طلب واحد فقط لـ Gemini)
                 await delay(2000);
-                
             } catch (err) {
-                console.error('خطأ أثناء طلب التضمين:', err);
+                console.error('خطأ أثناء طلب التضمين:', err.message);
                 retries++;
                 if (retries > 3) throw err;
                 await delay(5000);
@@ -118,7 +119,10 @@ async function embedChunksWithRetry(chunks, batchSize = 90) {
 
 async function processBook(filePath) {
     const parts = filePath.split('/');
-    const topicFolder = parts.length > 1 ? parts[1].toLowerCase() : 'aqeedah';
+    let topicFolder = 'aqeedah';
+    if (parts.length > 2 && parts[0] === 'test_sync') topicFolder = parts[2].toLowerCase();
+    else if (parts.length > 1) topicFolder = parts[1].toLowerCase();
+
     const fileName = parts[parts.length - 1];
     const sourceName = fileName.replace(/\.[^/.]+$/, "");
 
@@ -147,9 +151,10 @@ async function processBook(filePath) {
 
     console.log(`تم تقسيم الكتاب لـ: ${chunks.length} جزء (Chunk)`);
 
-    // استخراج المتجهات كلها أولاً بذكاء باستخدام fetch المجمعة لتفادي حد ال 15 طلب
+    // إرسال حتى 90 جزء في طلب API واحد لـ Gemini
     const valuesArray = await embedChunksWithRetry(chunks, 90);
     
+    // رفع الدفعات لـ Pinecone (50 متجه في كل دفعة مع البيانات الوصفية)
     for (let i = 0; i < chunks.length; i += 50) {
         const batchChunks = chunks.slice(i, i + 50);
         const batchValues = valuesArray.slice(i, i + 50);
@@ -167,8 +172,7 @@ async function processBook(filePath) {
                 };
             });
 
-            // تحديث طريقة رفع المصفوفة لتتوافق مع Pinecone V7
-            await index.upsert({ records: vectors });
+            await index.upsert(vectors);
             console.log(`تم رفع المتجهات الدفعة ${Math.floor(i / 50) + 1} لكتاب ${sourceName}`);
             
         } catch (error) {
