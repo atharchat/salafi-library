@@ -10,12 +10,12 @@ const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY1; 
 
 if (!PINECONE_API_KEY || !GEMINI_API_KEY) {
-    console.error("Missing API Keys: يرجى التأكد من إضافة أسرار Github.");
+    console.error('Missing API Keys: يرجى التأكد من إضافة أسرار Github.');
     process.exit(1);
 }
 
 const pc = new Pinecone({ apiKey: PINECONE_API_KEY });
-const index = pc.index("salafi-scholar");
+const index = pc.index('salafi-scholar');
 
 const addedFiles = process.env.ADDED_FILES ? process.env.ADDED_FILES.split(' ') : [];
 const modifiedFiles = process.env.MODIFIED_FILES ? process.env.MODIFIED_FILES.split(' ') : [];
@@ -24,8 +24,8 @@ const deletedFiles = process.env.DELETED_FILES ? process.env.DELETED_FILES.split
 const filesToProcess = [...addedFiles, ...modifiedFiles].filter(f => f.trim() !== '');
 const filesToDelete = deletedFiles.filter(f => f.trim() !== '');
 
-console.log("الملفات المطلوب مزامنتها:", filesToProcess);
-console.log("الملفات المطلوب حذفها:", filesToDelete);
+console.log('الملفات المطلوب مزامنتها:', filesToProcess);
+console.log('الملفات المطلوب حذفها:', filesToDelete);
 
 function parseContent(filePath, content) {
     if (filePath.endsWith('.htm') || filePath.endsWith('.html')) {
@@ -49,7 +49,7 @@ function chunkText(text, chunkSize = 1500, overlap = 200) {
 async function deleteBookVectors(filePath) {
     const parts = filePath.split('/');
     const fileName = parts[parts.length - 1];
-    const sourceName = fileName.replace(/\.[^/.]+$/, ""); 
+    const sourceName = fileName.replace(/\.[^/.]+$/, ''); 
 
     console.log(`جاري حـذف الكتاب: ${sourceName} من Pinecone...`);
     try {
@@ -64,6 +64,7 @@ const delay = ms => new Promise(res => setTimeout(res, ms));
 
 async function embedChunksWithRetry(chunks, batchSize = 90) {
     let allEmbeddings = [];
+    // تقسيم الملفات إلى دفعات من 90 لتدخل في طلب واحد لـ Gemini Batch API
     for (let i = 0; i < chunks.length; i += batchSize) {
         const batch = chunks.slice(i, i + batchSize);
         let success = false;
@@ -124,7 +125,7 @@ async function processBook(filePath) {
     else if (parts.length > 1) topicFolder = parts[1].toLowerCase();
 
     const fileName = parts[parts.length - 1];
-    const sourceName = fileName.replace(/\.[^/.]+$/, "");
+    const sourceName = fileName.replace(/\.[^/.]+$/, '');
 
     const topicMap = {
         'aqeedah': 'عقيدة',
@@ -160,10 +161,11 @@ async function processBook(filePath) {
         const batchValues = valuesArray.slice(i, i + 50);
         try {
             const vectors = batchChunks.map((text, idx) => {
-                const vectorId = crypto.createHash('md5').update(sourceName + "-chunk-" + (i + idx)).digest('hex');
+                const vectorId = crypto.createHash('md5').update(sourceName + '-chunk-' + (i + idx)).digest('hex');
+                // تجنب وجود أي قيم فارغة والتي تسبب خطأ Pinecone
                 return {
                     id: vectorId,
-                    values: batchValues[idx],
+                    values: batchValues[idx] || Array(768).fill(0),
                     metadata: {
                         source: sourceName,
                         topic: topic,
@@ -172,7 +174,16 @@ async function processBook(filePath) {
                 };
             });
 
-            await index.upsert(vectors);
+            // كود توافقية مع إصدارات Pinecone 4 والأحدث (Pinecone 7+)
+            try {
+                await index.upsert(vectors); // الصيغة القديمة SDK v4
+            } catch(e) {
+                if (e.message && e.message.includes('Must pass in at least 1 record')) {
+                    await index.upsert({ records: vectors }); // الصيغة الجديدة SDK v7+
+                } else {
+                    throw e;
+                }
+            }
             console.log(`تم رفع المتجهات الدفعة ${Math.floor(i / 50) + 1} لكتاب ${sourceName}`);
             
         } catch (error) {
@@ -198,6 +209,6 @@ async function main() {
 }
 
 main().catch(error => {
-    console.error("فشل السكريبت بشدة:", error);
+    console.error('فشل السكريبت بشدة:', error);
     process.exit(1);
 });
