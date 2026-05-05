@@ -1,7 +1,6 @@
 import fs from 'fs';
 import * as cheerio from 'cheerio';
 import { Pinecone } from '@pinecone-database/pinecone';
-import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
 
@@ -12,12 +11,11 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY1;
 
 if (!PINECONE_API_KEY || !GEMINI_API_KEY) {
     console.error("Missing API Keys: يرجى التأكد من إضافة أسرار Github.");
-    process.exit(1); // إغلاق النظام مع رمز خطأ ليعرف Github أن العملية فشلت
+    process.exit(1); 
 }
 
 const pc = new Pinecone({ apiKey: PINECONE_API_KEY });
 const index = pc.index("salafi-scholar");
-const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 
 const addedFiles = process.env.ADDED_FILES ? process.env.ADDED_FILES.split(' ') : [];
 const modifiedFiles = process.env.MODIFIED_FILES ? process.env.MODIFIED_FILES.split(' ') : [];
@@ -41,7 +39,8 @@ function chunkText(text, chunkSize = 1500, overlap = 200) {
     const chunks = [];
     let i = 0;
     while (i < text.length) {
-        chunks.push(text.slice(i, i + chunkSize));
+        let chunk = text.slice(i, i + chunkSize);
+        if (chunk.trim().length > 0) chunks.push(chunk);
         i += chunkSize - overlap;
     }
     return chunks;
@@ -54,15 +53,68 @@ async function deleteBookVectors(filePath) {
 
     console.log(`جاري حـذف الكتاب: ${sourceName} من Pinecone...`);
     try {
-        await index.deleteMany({ filter: { source: { $eq: sourceName } } });
+        await index.deleteMany({ filter: { source: sourceName } });
         console.log(`تم الحذف بنجاح: ${sourceName}`);
     } catch (error) {
         console.log(`لم يتم العثور على أجزاء لحذفها، أو حدث خطأ: ${sourceName}`, error.message);
     }
 }
 
-// دالة تأخير لمنع تجاوز معدل API
 const delay = ms => new Promise(res => setTimeout(res, ms));
+
+async function embedChunksWithRetry(chunks, batchSize = 90) {
+    let allEmbeddings = [];
+    for (let i = 0; i < chunks.length; i += batchSize) {
+        const batch = chunks.slice(i, i + batchSize);
+        let success = false;
+        let retries = 0;
+        
+        while (!success) {
+            try {
+                const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents?key=' + GEMINI_API_KEY;
+                const requests = batch.map(text => ({
+                    model: 'models/gemini-embedding-2', 
+                    content: { parts: [{ text }] },
+                    outputDimensionality: 768
+                }));
+                
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ requests })
+                });
+                
+                const data = await res.json();
+                
+                if (data.error) {
+                    if (data.error.code === 429) {
+                        console.log('تم حظر المعدل (429 Rate Limit)، ننتظر 60 ثانية قبل إعادة المحاولة...');
+                        await delay(60000);
+                        retries++;
+                        continue;
+                    }
+                    throw new Error(data.error.message);
+                }
+                
+                if (!data.embeddings || data.embeddings.length !== batch.length) {
+                    throw new Error('استجابة غير متطابقة من مزود خدمة التضمين.');
+                }
+                
+                allEmbeddings.push(...data.embeddings.map(e => e.values));
+                success = true;
+                
+                await delay(2000);
+                
+            } catch (err) {
+                console.error('خطأ أثناء طلب التضمين:', err);
+                retries++;
+                if (retries > 3) throw err;
+                await delay(5000);
+            }
+        }
+    }
+    return allEmbeddings;
+}
 
 async function processBook(filePath) {
     const parts = filePath.split('/');
@@ -95,21 +147,18 @@ async function processBook(filePath) {
 
     console.log(`تم تقسيم الكتاب لـ: ${chunks.length} جزء (Chunk)`);
 
-    for (let i = 0; i < chunks.length; i += 10) {
-        const batchChunks = chunks.slice(i, i + 10);
+    // استخراج المتجهات كلها أولاً بذكاء باستخدام fetch المجمعة لتفادي حد ال 15 طلب
+    const valuesArray = await embedChunksWithRetry(chunks, 90);
+    
+    for (let i = 0; i < chunks.length; i += 50) {
+        const batchChunks = chunks.slice(i, i + 50);
+        const batchValues = valuesArray.slice(i, i + 50);
         try {
-            // استخدام قدرة Gemini على تضمين مصفوفة كاملة في طلب واحد بدلاً من 10 طلبات متوازية
-            const response = await ai.models.embedContent({
-                model: 'gemini-embedding-2',
-                contents: batchChunks, 
-                config: { outputDimensionality: 768 }
-            });
-            
             const vectors = batchChunks.map((text, idx) => {
                 const vectorId = crypto.createHash('md5').update(sourceName + "-chunk-" + (i + idx)).digest('hex');
                 return {
                     id: vectorId,
-                    values: response.embeddings[idx].values,
+                    values: batchValues[idx],
                     metadata: {
                         source: sourceName,
                         topic: topic,
@@ -118,15 +167,13 @@ async function processBook(filePath) {
                 };
             });
 
-            await index.upsert(vectors); // في Pinecone ^4.0.0 نضع المصفوفة مباشرة هكذا
-            console.log(`تم رفع الدفعة ${i / 10 + 1} لكتاب ${sourceName}`);
+            // تحديث طريقة رفع المصفوفة لتتوافق مع Pinecone V7
+            await index.upsert({ records: vectors });
+            console.log(`تم رفع المتجهات الدفعة ${Math.floor(i / 50) + 1} لكتاب ${sourceName}`);
             
-            // إيقاف مؤقت لمدة 4.5 ثوانٍ لتفادي تجاوز حد 15 طلب في الدقيقة للـ Free Tier
-            await delay(4500); 
-
         } catch (error) {
-            console.error(`خطأ حرج أثناء رفع كتاب ${sourceName}:`, error.message);
-            process.exit(1); // إغلاق النظام مع رمز خطأ ليعرف Github ويفشل علنياً
+            console.error(`خطأ حرج أثناء رفع المتجهات لكتاب ${sourceName}:`, error.message);
+            process.exit(1); 
         }
     }
     console.log(`✅ انتهت مزامنة كتاب: ${sourceName}`);
@@ -134,19 +181,19 @@ async function processBook(filePath) {
 
 async function main() {
     for (const file of filesToDelete) {
-        if (file.startsWith('books/')) {
+        if (file.includes('books/')) {
             await deleteBookVectors(file);
         }
     }
 
     for (const file of filesToProcess) {
-        if (file.startsWith('books/') && (file.endsWith('.txt') || file.endsWith('.htm') || file.endsWith('.html'))) {
+        if (file.includes('books/') && (file.endsWith('.txt') || file.endsWith('.htm') || file.endsWith('.html'))) {
             await processBook(file);
         }
     }
 }
 
 main().catch(error => {
-    console.error("فشل السكريبت:", error);
+    console.error("فشل السكريبت بشدة:", error);
     process.exit(1);
 });
