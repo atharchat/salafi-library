@@ -1,27 +1,20 @@
+// [مهم] هذا الملف يستخدم لمزامنة الكتب من وإلى قاعدة البيانات بصيغة المتجهات Pinecone 
+// يتم استدعاؤه سواء في السيرفر أو عبر الـ Github Actions
 import fs from 'fs';
-import * as cheerio from 'cheerio';
+import path from 'path';
+import 'dotenv/config';
+import { GoogleGenAI } from '@google/genai';
 import { Pinecone } from '@pinecone-database/pinecone';
-import dotenv from 'dotenv';
-import crypto from 'crypto';
+import * as cheerio from 'cheerio';
 
-dotenv.config();
-
-const PINECONE_API_KEY = process.env.PINECONE_API_KEY || '';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY1 || ''; 
-
-if (!PINECONE_API_KEY || !GEMINI_API_KEY) {
-    console.error('Missing API Keys: يرجى التأكد من إضافة أسرار Github.');
-    process.exit(1);
-}
-
-const pc = new Pinecone({ apiKey: PINECONE_API_KEY });
-const index = pc.index('salafi-scholar');
+const TOPICS = ["عقيدة", "تفسير", "حديث", "فقه", "سيرة وتراجم", "تاريخ", "General"];
 
 function parseFiles(envVar) {
     if (!envVar || envVar.trim() === '') return [];
     
     let cleaned = envVar.trim();
     
+    // Remove wrapping array brackets if present
     if (cleaned.startsWith('[') && cleaned.endsWith(']')) {
         cleaned = cleaned.substring(1, cleaned.length - 1);
     }
@@ -31,6 +24,7 @@ function parseFiles(envVar) {
     
     const parsed = list.map(function(f) {
         let s = f.trim();
+        // Handle single or double quotes wrapping the filename
         if ((s.startsWith("'") && s.endsWith("'")) || (s.startsWith('"') && s.endsWith('"'))) {
             s = s.substring(1, s.length - 1);
         }
@@ -50,22 +44,10 @@ function parseFiles(envVar) {
     return parsed;
 }
 
-const addedFiles = parseFiles(process.env.ADDED_FILES);
-const modifiedFiles = parseFiles(process.env.MODIFIED_FILES);
-const deletedFiles = parseFiles(process.env.DELETED_FILES);
-
-const filesToProcess = Array.from(new Set([...addedFiles, ...modifiedFiles]));
-
-console.log('============= بدء المزامنة =============');
-console.log('الملفات المطلوب رفعها:', filesToProcess);
-console.log('الملفات المطلوب حذفها:', deletedFiles);
-console.log('========================================');
-
 function parseContent(filePath, content) {
     if (filePath.endsWith('.htm') || filePath.endsWith('.html')) {
         const $ = cheerio.load(content);
         
-        // مسح الهوامش والشروحات السفلية
         $('.footnote, .footnotes, .hashiya, .hasheya, .margnote, .notes, .commentary').remove();
         
         $('div.PageText').each(function() {
@@ -86,7 +68,7 @@ function parseContent(filePath, content) {
         let isSkipping = false;
         
         $('.PageText').each(function(index) {
-            if (index === 0) return; // تجاوز المجلد التعريفي الأول
+            if (index === 0) return;
 
             let titles = [];
             $(this).find('.title, [data-type="title"]').each(function() {
@@ -125,11 +107,10 @@ function parseContent(filePath, content) {
             
             if (!isSkipping) {
                 let text = $(this).text();
-                // تنظيف بعض أرقام الهوامش والرموز المتداخلة 
                 text = text.replace(/\[\d+\]/g, ''); 
                 text = text.replace(/\(\d+\)/g, ''); 
-                text = text.replace(/^[([\s]*\d+[\s]*[)\]].*$/gm, '');
-                text = text.replace(/^[\s]*=.*$/gm, '');
+                text = text.replace(/^([\s]*\d+[\s]*[)\]])/gm, '');
+                text = text.replace(/^[\s]*=.*/gm, '');
                 text = text.replace(/\s+/g, ' ').trim();
                 if (text.length > 0) {
                     finalBlocks.push(text);
@@ -142,118 +123,123 @@ function parseContent(filePath, content) {
     return content;
 }
 
-function chunkText(text, chunkSize = 1500, overlap = 200) {
+function chunkText(text) {
+    const maxWords = 700;
+    const overlap = 70;
+    const blocks = text.split('\n\n').filter(b => b.trim() !== '');
     const chunks = [];
-    let i = 0;
-    while (i < text.length) {
-        let chunk = text.slice(i, i + chunkSize);
-        if (chunk.trim().length > 0) chunks.push(chunk);
-        i += chunkSize - overlap;
-    }
-    return chunks;
-}
-
-async function deleteBookVectors(filePath) {
-    const parts = filePath.split('/');
-    const fileName = parts[parts.length - 1];
-    const sourceName = fileName.replace(/\.[^/.]+$/, ''); 
-
-    console.log("جاري حـذف الكتاب: " + sourceName + " من Pinecone...");
-    try {
-        await index.deleteMany({ source: sourceName });
-        console.log("تم الحذف بنجاح (direct filter): " + sourceName);
-    } catch (error) {
-        try {
-            await index.deleteMany({ filter: { source: sourceName } });
-            console.log("تم الحذف بنجاح (nested filter): " + sourceName);
-        } catch (err2) {
-            console.log("تخطي الحذف أو حدث خطأ: " + sourceName);
-        }
-    }
-}
-
-const delay = function(ms) { return new Promise(function(res) { setTimeout(res, ms); }); };
-
-async function embedChunksWithRetry(chunks, batchSize) {
-    if (!batchSize) batchSize = 90;
-    let allEmbeddings = [];
-    for (let i = 0; i < chunks.length; i += batchSize) {
-        const batch = chunks.slice(i, i + batchSize);
-        let success = false;
-        let retries = 0;
+    
+    let currentChunkWords = [];
+    
+    for (let i = 0; i < blocks.length; i++) {
+        const block = blocks[i];
+        const blockWords = block.split(/\s+/);
         
-        while (!success) {
-            try {
-                const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents?key=' + GEMINI_API_KEY;
-                const requests = batch.map(function(text) { return {
-                    model: 'models/gemini-embedding-2', 
-                    content: { parts: [{ text: text }] },
-                    outputDimensionality: 768
-                };});
-                
-                const res = await fetch(url, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ requests: requests })
-                });
-                
-                const data = await res.json();
-                
-                if (data.error) {
-                    if (data.error.code === 429) {
-                        console.log('تم حظر المعدل (429 Rate Limit)، ننتظر 60 ثانية... (محاولة ' + (retries + 1) + ')');
-                        await delay(60000);
-                        retries++;
-                        continue;
-                    }
-                    throw new Error(data.error.message);
+        if (currentChunkWords.length + blockWords.length <= maxWords) {
+            currentChunkWords = currentChunkWords.concat(blockWords);
+        } else {
+            if (currentChunkWords.length > 0) {
+                chunks.push(currentChunkWords.join(' '));
+                const overlapWords = currentChunkWords.slice(-overlap);
+                currentChunkWords = overlapWords.concat(blockWords);
+            } else {
+                let currentPos = 0;
+                while (currentPos < blockWords.length) {
+                    const chunkPart = blockWords.slice(currentPos, currentPos + maxWords);
+                    chunks.push(chunkPart.join(' '));
+                    currentPos += maxWords - overlap;
                 }
-                
-                if (!data.embeddings || data.embeddings.length !== batch.length) {
-                    throw new Error('استجابة المتجهات غير صحيحة من جوجل.');
+                if (chunks.length > 0) {
+                    const lastChunk = chunks[chunks.length - 1].split(/\s+/);
+                    currentChunkWords = lastChunk.slice(-overlap);
                 }
-                
-                allEmbeddings.push(...data.embeddings.map(function(e){ return e.values; }));
-                success = true;
-                await delay(3000); 
-            } catch (err) {
-                console.error("خطأ أثناء التضمين للدفعة " + i + ": ", err.message);
-                retries++;
-                if (retries > 3) throw err;
-                await delay(5000 * retries);
             }
         }
     }
-    return allEmbeddings;
+    
+    if (currentChunkWords.length > 0) {
+        chunks.push(currentChunkWords.join(' '));
+    }
+    
+    return chunks;
 }
 
-async function processBook(filePath) {
-    if (!fs.existsSync(filePath)) {
-        console.log("تخطي: الملف غير موجود محلياً: " + filePath);
-        return;
+const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
+const PINECONE_INDEX_NAME = "knowledge-base";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY1 || process.env.GEMINI_API_KEY;
+
+if (!PINECONE_API_KEY || !GEMINI_API_KEY) {
+    console.error("يرجى التأكد من توفر PINECONE_API_KEY و GEMINI_API_KEY في المتغيرات البيئية.");
+    process.exit(1);
+}
+
+const pc = new Pinecone({ apiKey: PINECONE_API_KEY });
+const index = pc.Index(PINECONE_INDEX_NAME);
+const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+
+async function embedChunksWithRetry(chunks, maxConcurrent = 100) {
+    let results = new Array(chunks.length);
+    let activePromises = [];
+    
+    for (let i = 0; i < chunks.length; i++) {
+        const p = (async () => {
+            let retries = 0;
+            const maxRetries = 5;
+            let delay = 2000;
+            while (retries < maxRetries) {
+                try {
+                    const response = await ai.models.embedContent({
+                        model: 'text-embedding-004',
+                        contents: chunks[i],
+                    });
+                    results[i] = response.embeddings[0].values;
+                    break;
+                } catch (error) {
+                    if (error.message && (error.message.includes('429') || error.message.includes('RESOURCE_EXHAUSTED'))) {
+                        retries++;
+                        console.log(`[Rate Limit] تأخير ${delay}ms وإعادة المحاولة للجزء ${i}...`);
+                        await new Promise(res => setTimeout(res, delay));
+                        delay *= 2;
+                    } else {
+                        throw error;
+                    }
+                }
+            }
+        })();
+        
+        activePromises.push(p);
+        
+        if (activePromises.length >= maxConcurrent) {
+            await Promise.race(activePromises);
+            activePromises = activePromises.filter(p => {
+                const inspect = process.binding('util').getPromiseDetails(p);
+                return inspect[0] === 0; // 0 = pending
+            });
+        }
     }
+    
+    await Promise.all(activePromises);
+    return results;
+}
 
+async function handleAddedOrModified(filePath) {
+    console.log(`> جاري البدء بمعالجة: ${filePath}`);
+    const sourceName = path.basename(filePath);
+    let topic = "General";
+    
     const parts = filePath.split('/');
-    let topicFolder = 'aqeedah';
-    if (parts.length > 2 && parts[0] === 'test_sync') topicFolder = parts[2].toLowerCase();
-    else if (parts.length > 1) topicFolder = parts[1].toLowerCase();
-
-    const fileName = parts[parts.length - 1];
-    const sourceName = fileName.replace(/\.[^/.]+$/, '');
-
-    const topicMap = {
-        'aqeedah': 'عقيدة',
-        'tafsir': 'تفسير',
-        'hadith': 'حديث',
-        'fiqh': 'فقه',
-        'seerah': 'سيرة وتراجم',
-        'history': 'تاريخ'
-    };
-    const topic = topicMap[topicFolder] || 'عقيدة';
-
-    console.log("\n📚 معالجة: " + sourceName + " (" + topic + ")");
-
-    await deleteBookVectors(filePath);
+    if (parts.length > 2 && parts[0] === 'books') {
+        const t = parts[1];
+        const topicMap = {
+            "aqeedah": "عقيدة",
+            "tafsir": "تفسير",
+            "hadeeth": "حديث",
+            "fiqh": "فقه",
+            "seerah": "سيرة وتراجم",
+            "history": "تاريخ"
+        };
+        topic = topicMap[t] || "General";
+    }
 
     const rawContent = fs.readFileSync(filePath, 'utf8');
     const textContent = parseContent(filePath, rawContent);
@@ -261,11 +247,11 @@ async function processBook(filePath) {
 
     let arabicTitle = sourceName;
     if (filePath.endsWith('.htm') || filePath.endsWith('.html')) {
-        const cheerio = require('cheerio');
+        const cheerio = await import('cheerio');
         const $ = cheerio.load(rawContent);
         const parsedTitle = $('title').first().text().trim();
         if (parsedTitle && parsedTitle.length > 0) {
-            arabicTitle = parsedTitle; // هنا نقوم باستخلاص العنوان الداخلي للكتاب باللغة العربية الصحيحة
+            arabicTitle = parsedTitle;
         }
     }
 
@@ -282,60 +268,95 @@ async function processBook(filePath) {
         const batchChunks = chunks.slice(i, i + 50);
         const batchValues = valuesArray.slice(i, i + 50);
         
-        try {
-            const vectors = batchChunks.map(function(text, idx) {
-                const vectorId = crypto.createHash('md5').update(sourceName + '-' + (i + idx)).digest('hex');
-                const vals = (batchValues[idx] && batchValues[idx].length === 768) ? batchValues[idx] : Array(768).fill(0);
-                return {
-                    id: vectorId,
-                    values: vals,
-                    metadata: {
-                        source: sourceName,
-                        book_title: arabicTitle,
-                        topic: topic,
-                        text: text
-                    }
-                };
-            });
-
-            try {
-                await index.upsert(vectors);
-            } catch (err) {
-                if (err.message && err.message.includes('at least')) {
-                    await index.upsert({ records: vectors });
-                } else {
-                    throw err;
+        const vectors = batchChunks.map((text, idx) => {
+            const vals = batchValues[idx];
+            return {
+                id: `${sourceName}-chunk-${i + idx}`,
+                values: vals,
+                metadata: {
+                    source: sourceName,
+                    book_title: arabicTitle,
+                    topic: topic,
+                    text: text
                 }
-            }
-            console.log("   تم رفع المتجهات " + (i+1) + " إلى " + (i + batchChunks.length));
-        } catch (error) {
-            console.error("خطأ خطير أثناء الرفع لدفعة " + sourceName + ":", error.message);
-            process.exit(1); 
-        }
+            };
+        });
+        
+        await index.upsert(vectors);
     }
-    console.log("✅ انتهت المزامنة بنجاح: " + arabicTitle);
+    console.log(`تم رفع ${filePath} بنجاح.`);
+}
+
+async function handleDeleted(filePath) {
+    const sourceName = path.basename(filePath);
+    console.log(`> جاري حذف المتجهات المرتبطة بـ: ${sourceName}`);
+    
+    try {
+        let hasMore = true;
+        let totalDeleted = 0;
+        
+        while (hasMore) {
+            const queryResponse = await index.query({
+                topK: 100,
+                vector: new Array(768).fill(0), // Dummy vector
+                filter: { "source": { "$eq": sourceName } },
+                includeMetadata: false
+            });
+            
+            if (queryResponse.matches.length === 0) {
+                hasMore = false;
+            } else {
+                const idsToDelete = queryResponse.matches.map(m => m.id);
+                await index.deleteMany(idsToDelete);
+                totalDeleted += idsToDelete.length;
+            }
+        }
+        
+        console.log(`تم حذف ${totalDeleted} متجه من كتاب ${sourceName} بنجاح.`);
+    } catch (error) {
+         console.error("خطأ أثناء الحذف:", error);
+    }
 }
 
 async function main() {
-    if (deletedFiles.length === 0 && filesToProcess.length === 0) {
-        console.log('لا يوجد شيء للقيام به.');
+    console.log("============= بدء المزامنة =============");
+    const addedStr = process.env.ADDED_FILES || "";
+    const modifiedStr = process.env.MODIFIED_FILES || "";
+    const deletedStr = process.env.DELETED_FILES || "";
+
+    const added = parseFiles(addedStr);
+    const modified = parseFiles(modifiedStr);
+    const deleted = parseFiles(deletedStr);
+
+    console.log("الملفات المطلوب رفعها:", [...added, ...modified]);
+    console.log("الملفات المطلوب حذفها:", deleted);
+    console.log("========================================");
+
+    if (added.length === 0 && modified.length === 0 && deleted.length === 0) {
+        console.log("لا يوجد شيء للقيام به.");
         return;
     }
 
-    for (const file of deletedFiles) {
-        if (file.includes('books/')) {
-            await deleteBookVectors(file);
+    // Handle deleted files
+    for (const f of deleted) {
+        if(f.startsWith("books/")) {
+             await handleDeleted(f);
         }
     }
 
-    for (const file of filesToProcess) {
-        if (file && file.includes('books/') && (file.endsWith('.txt') || file.endsWith('.htm') || file.endsWith('.html'))) {
-            await processBook(file);
+    // Handle added/modified
+    const toUpload = [...added, ...modified];
+    for (const f of toUpload) {
+        if (f.startsWith("books/")) {
+            if (fs.existsSync(f)) {
+                 await handleDeleted(f); // delete old vectors first if modified
+                 await handleAddedOrModified(f);
+            } else {
+                 console.log("الملف غير موجود " + f + " قد يكون تم حذفه.");
+            }
         }
     }
+    console.log("============= اكتملت المزامنة =============");
 }
 
-main().catch(function(error) {
-    console.error('❌ توقف السكربت بسبب خطأ غير متوقع:', error);
-    process.exit(1);
-});
+main().catch(console.error);
