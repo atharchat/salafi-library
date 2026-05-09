@@ -6,8 +6,8 @@ import crypto from 'crypto';
 
 dotenv.config();
 
-const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY1; 
+const PINECONE_API_KEY = process.env.PINECONE_API_KEY || '';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY1 || ''; 
 
 if (!PINECONE_API_KEY || !GEMINI_API_KEY) {
     console.error('Missing API Keys: يرجى التأكد من إضافة أسرار Github.');
@@ -17,15 +17,31 @@ if (!PINECONE_API_KEY || !GEMINI_API_KEY) {
 const pc = new Pinecone({ apiKey: PINECONE_API_KEY });
 const index = pc.index('salafi-scholar');
 
-const addedFiles = process.env.ADDED_FILES ? process.env.ADDED_FILES.split(' ') : [];
-const modifiedFiles = process.env.MODIFIED_FILES ? process.env.MODIFIED_FILES.split(' ') : [];
-const deletedFiles = process.env.DELETED_FILES ? process.env.DELETED_FILES.split(' ') : [];
+// Helper to safely parse file lists from Github Actions
+function parseFiles(envVar) {
+    if (!envVar || envVar.trim() === '') return [];
+    let cleaned = envVar.trim();
+    if (cleaned.startsWith('[') && cleaned.endsWith(']')) {
+        try {
+            return JSON.parse(cleaned.replace(/'/g, '"')).filter(f => f && f.trim() !== '');
+        } catch(e) {
+            cleaned = cleaned.replace(/^[|]$/g, '').trim();
+        }
+    }
+    const list = cleaned.split(/[s,]+/);
+    return list.map(f => f.replace(/^['"](.*)['"]$/, '')).filter(f => f.trim() !== '');
+}
 
-const filesToProcess = [...addedFiles, ...modifiedFiles].filter(f => f.trim() !== '');
-const filesToDelete = deletedFiles.filter(f => f.trim() !== '');
+const addedFiles = parseFiles(process.env.ADDED_FILES);
+const modifiedFiles = parseFiles(process.env.MODIFIED_FILES);
+const deletedFiles = parseFiles(process.env.DELETED_FILES);
 
+const filesToProcess = [...addedFiles, ...modifiedFiles];
+
+console.log('--- تقرير الملفات المستلمة للسكربت ---');
 console.log('الملفات المطلوب مزامنتها:', filesToProcess);
-console.log('الملفات المطلوب حذفها:', filesToDelete);
+console.log('الملفات المطلوب حذفها:', deletedFiles);
+console.log('--------------------------------------');
 
 function parseContent(filePath, content) {
     if (filePath.endsWith('.htm') || filePath.endsWith('.html')) {
@@ -56,7 +72,7 @@ async function deleteBookVectors(filePath) {
         await index.deleteMany({ filter: { source: sourceName } });
         console.log(`تم الحذف بنجاح: ${sourceName}`);
     } catch (error) {
-        console.log(`لم يتم العثور على أجزاء لحذفها، أو حدث خطأ: ${sourceName}`, error.message);
+        console.log(`حدث خطأ أثناء الحذف: ${sourceName} - ${error.message}`);
     }
 }
 
@@ -64,7 +80,6 @@ const delay = ms => new Promise(res => setTimeout(res, ms));
 
 async function embedChunksWithRetry(chunks, batchSize = 90) {
     let allEmbeddings = [];
-    // تقسيم الملفات إلى دفعات من 90 لتدخل في طلب واحد لـ Gemini Batch API
     for (let i = 0; i < chunks.length; i += batchSize) {
         const batch = chunks.slice(i, i + batchSize);
         let success = false;
@@ -98,20 +113,20 @@ async function embedChunksWithRetry(chunks, batchSize = 90) {
                 }
                 
                 if (!data.embeddings || data.embeddings.length !== batch.length) {
-                    console.log('Data error context:', data);
+                    console.error('إجابة الموديل لا تتطابق مع الحجم المرسل:', data);
                     throw new Error('استجابة غير متطابقة من مزود خدمة التضمين.');
                 }
                 
                 allEmbeddings.push(...data.embeddings.map(e => e.values));
                 success = true;
                 
-                // انتظار بسيط لمدة ثانيتين بين كل 90 جزء (طلب واحد فقط لـ Gemini)
-                await delay(2000);
+                // انتظار بين كل طلب لضمان عدم تجاوز السعة للـ Free Tier
+                await delay(3000);
             } catch (err) {
-                console.error('خطأ أثناء طلب التضمين:', err.message);
+                console.error('خطأ طلب التضمين الدفعة', Math.ceil(i/batchSize)+1, ':', err.message);
                 retries++;
                 if (retries > 3) throw err;
-                await delay(5000);
+                await delay(5000 * retries);
             }
         }
     }
@@ -119,6 +134,7 @@ async function embedChunksWithRetry(chunks, batchSize = 90) {
 }
 
 async function processBook(filePath) {
+    console.log(`بدء معالجة: ${filePath}`);
     const parts = filePath.split('/');
     let topicFolder = 'aqeedah';
     if (parts.length > 2 && parts[0] === 'test_sync') topicFolder = parts[2].toLowerCase();
@@ -137,12 +153,12 @@ async function processBook(filePath) {
     };
     const topic = topicMap[topicFolder] || 'عقيدة';
 
-    console.log(`جاري معالجة الكـتـاب >> ${sourceName} | التخصص >> ${topic}`);
+    console.log(`الكـتـاب >> ${sourceName} | التخصص >> ${topic}`);
 
     await deleteBookVectors(filePath);
 
     if (!fs.existsSync(filePath)) {
-        console.log(`الملف غير موجود محلياً (قد يكون تم حذفه): ${filePath}`);
+        console.log(`الملف غير موجود محلياً (تخطي الرفع): ${filePath}`);
         return;
     }
 
@@ -151,18 +167,21 @@ async function processBook(filePath) {
     const chunks = chunkText(textContent);
 
     console.log(`تم تقسيم الكتاب لـ: ${chunks.length} جزء (Chunk)`);
+    if (chunks.length === 0) {
+        console.log(`تخطي الملف، لا يوجد محتوى نصي لرفعه...`);
+        return;
+    }
 
-    // إرسال حتى 90 جزء في طلب API واحد لـ Gemini
     const valuesArray = await embedChunksWithRetry(chunks, 90);
     
-    // رفع الدفعات لـ Pinecone (50 متجه في كل دفعة مع البيانات الوصفية)
+    // رفع الدفعات
     for (let i = 0; i < chunks.length; i += 50) {
         const batchChunks = chunks.slice(i, i + 50);
         const batchValues = valuesArray.slice(i, i + 50);
+        
         try {
             const vectors = batchChunks.map((text, idx) => {
                 const vectorId = crypto.createHash('md5').update(sourceName + '-chunk-' + (i + idx)).digest('hex');
-                // تجنب وجود أي قيم فارغة والتي تسبب خطأ Pinecone
                 return {
                     id: vectorId,
                     values: batchValues[idx] || Array(768).fill(0),
@@ -174,28 +193,32 @@ async function processBook(filePath) {
                 };
             });
 
-            // كود توافقية مع إصدارات Pinecone 4 والأحدث (Pinecone 7+)
-            try {
-                await index.upsert(vectors); // الصيغة القديمة SDK v4
-            } catch(e) {
-                if (e.message && e.message.includes('Must pass in at least 1 record')) {
-                    await index.upsert({ records: vectors }); // الصيغة الجديدة SDK v7+
-                } else {
-                    throw e;
-                }
+            try { 
+                await index.upsert(vectors); 
+            } catch(e) { 
+                if (e.message && e.message.includes('at least')) { 
+                    await index.upsert({ records: vectors }); 
+                } else { 
+                    throw e; 
+                } 
             }
-            console.log(`تم رفع المتجهات الدفعة ${Math.floor(i / 50) + 1} لكتاب ${sourceName}`);
+            console.log(`تم رفع المتجهات للدفعة رقم ${Math.floor(i / 50) + 1} بنجاح`);
             
         } catch (error) {
-            console.error(`خطأ حرج أثناء رفع المتجهات لكتاب ${sourceName}:`, error.message);
+            console.error(`خطأ أثناء رفع المتجهات، الدفعة ${Math.floor(i / 50) + 1}:`, error.message);
             process.exit(1); 
         }
     }
-    console.log(`✅ انتهت مزامنة كتاب: ${sourceName}`);
+    console.log(`✅ اكتملت مزامنة كتاب: ${sourceName}`);
 }
 
 async function main() {
-    for (const file of filesToDelete) {
+    if (deletedFiles.length === 0 && filesToProcess.length === 0) {
+        console.log('لا يوجد ملفات جديدة أو محذوفة للعمل عليها.');
+        return;
+    }
+
+    for (const file of deletedFiles) {
         if (file.includes('books/')) {
             await deleteBookVectors(file);
         }
@@ -209,6 +232,6 @@ async function main() {
 }
 
 main().catch(error => {
-    console.error('فشل السكريبت بشدة:', error);
+    console.error('فشل غير متوقع في العملية الرئيسية:', error);
     process.exit(1);
 });
