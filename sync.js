@@ -7,10 +7,10 @@ import crypto from 'crypto';
 dotenv.config();
 
 const PINECONE_API_KEY = process.env.PINECONE_API_KEY || '';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY1 || '';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY1 || ''; 
 
 if (!PINECONE_API_KEY || !GEMINI_API_KEY) {
-    console.error('Missing API Keys');
+    console.error('Missing API Keys: يرجى التأكد من إضافة أسرار Github.');
     process.exit(1);
 }
 
@@ -19,23 +19,32 @@ const index = pc.index('salafi-scholar');
 
 function parseFiles(envVar) {
     if (!envVar || envVar.trim() === '') return [];
+    
     let cleaned = envVar.trim();
+    
+    // Remove wrapping array brackets if present
     if (cleaned.startsWith('[') && cleaned.endsWith(']')) {
         cleaned = cleaned.substring(1, cleaned.length - 1);
     }
+    
+    // Split by either comma or space
     const list = cleaned.split(/[\s,]+/);
     const parsed = list.map(function(f) {
         let s = f.trim();
-        if (s.startsWith('\'') && s.endsWith('\'')) { s = s.substring(1, s.length - 1); }
-        else if (s.startsWith('\"') && s.endsWith('\"')) { s = s.substring(1, s.length - 1); }
+        // Handle single or double quotes wrapping the filename
+        if ((s.startsWith("'") && s.endsWith("'")) || (s.startsWith('"') && s.endsWith('"'))) {
+            s = s.substring(1, s.length - 1);
+        }
         return s;
     }).filter(function(f) { return f !== ''; });
+    
     return parsed;
 }
 
 const addedFiles = parseFiles(process.env.ADDED_FILES);
 const modifiedFiles = parseFiles(process.env.MODIFIED_FILES);
 const deletedFiles = parseFiles(process.env.DELETED_FILES);
+
 const filesToProcess = Array.from(new Set([...addedFiles, ...modifiedFiles]));
 
 console.log('============= بدء المزامنة =============');
@@ -46,7 +55,82 @@ console.log('========================================');
 function parseContent(filePath, content) {
     if (filePath.endsWith('.htm') || filePath.endsWith('.html')) {
         const $ = cheerio.load(content);
-        return $.text().replace(/\s+/g, ' ').trim();
+        
+        // 1. Remove footnotes completely
+        $('.footnote, .footnotes, .hashiya, .hasheya, .margnote, .notes, .commentary').remove();
+        
+        // In Shamela, footnotes are often separated by an <hr width="95">
+        $('div.PageText').each(function() {
+            let foundHr = false;
+            $(this).contents().each(function() {
+                if (foundHr) {
+                    $(this).remove();
+                } else if ((this.tagName === 'hr' || this.tagName === 'HR' || this.name === 'hr') && $(this).attr('width') == '95') {
+                    foundHr = true;
+                    $(this).remove();
+                }
+            });
+        });
+        
+        $('.PageHead').remove();
+
+        // 2. Remove Introductions and Indices
+        let finalBlocks = [];
+        let isSkipping = false;
+        
+        $('.PageText').each(function(index) {
+            if (index === 0) return; // Skip metadata page
+
+            let titles = [];
+            $(this).find('.title, [data-type="title"]').each(function() {
+                titles.push($(this).text().trim());
+            });
+            
+            let isMuhaqqiqOrIndex = false;
+            for (let t of titles) {
+                t = t.replace(/[^ \u0600-\u06FF]/g, '').trim();
+                const skipKeywords = ['مقدمة التحقيق', 'مقدمة المحقق', 'عملي في', 'ترجمة', 'فهرس', 'تقديم', 'المراجع', 'المصادر', 'فهارس', 'وصف المخطوط', 'الرموز'];
+                for (const kw of skipKeywords) {
+                    if (t.startsWith(kw) || t.includes('فهرس') || t.includes('المراجع') || t.includes('المصادر')) {
+                        isMuhaqqiqOrIndex = true;
+                        break;
+                    }
+                }
+            }
+            
+            for (let t of titles) {
+                t = t.replace(/[^ \u0600-\u06FF]/g, '').trim();
+                if (t.match(/^(مقدمة المؤلف|كتاب|باب|فصل|القول)/)) {
+                    isSkipping = false;
+                }
+            }
+
+            if (isMuhaqqiqOrIndex) {
+                isSkipping = true;
+            } else if (titles.length > 0) {
+                isSkipping = false;
+            }
+            
+            let cleanText = $(this).text().replace(/[\u064B-\u065F]/g, '').trim();
+            if (cleanText.match(/^(?:بسم لله|بسم الله|الحمد لله|قال المؤلف|أما بعد|أصول|حدثنا|أخبرنا|أخبرني|حدثني)/)) {
+                isSkipping = false;
+            }
+            
+            if (!isSkipping) {
+                let text = $(this).text();
+                // some extra footnote cleanups: remove lines starting with = or regex matches 
+                text = text.replace(/\[\d+\]/g, ''); 
+                text = text.replace(/\(\d+\)/g, ''); 
+                text = text.replace(/^[([\s]*\d+[\s]*[)\]].*$/gm, '');
+                text = text.replace(/^[\s]*=.*$/gm, '');
+                text = text.replace(/\s+/g, ' ').trim();
+                if (text.length > 0) {
+                    finalBlocks.push(text);
+                }
+            }
+        });
+        
+        return finalBlocks.join('\n\n');
     }
     return content;
 }
@@ -65,17 +149,19 @@ function chunkText(text, chunkSize = 1500, overlap = 200) {
 async function deleteBookVectors(filePath) {
     const parts = filePath.split('/');
     const fileName = parts[parts.length - 1];
-    const sourceName = fileName.replace(/\.[^/.]+$/, '');
-    console.log('جاري حـذف الكتاب: ' + sourceName + ' من Pinecone...');
+    const sourceName = fileName.replace(/\.[^/.]+$/, ''); 
+
+    console.log("جاري حـذف الكتاب: " + sourceName + " من Pinecone...");
     try {
         await index.deleteMany({ source: sourceName });
-        console.log('تم الحذف بنجاح (direct filter): ' + sourceName);
+        console.log("تم الحذف بنجاح (direct filter): " + sourceName);
     } catch (error) {
+        // Fallback for older pinecone versions
         try {
             await index.deleteMany({ filter: { source: sourceName } });
-            console.log('تم الحذف بنجاح (nested filter): ' + sourceName);
+            console.log("تم الحذف بنجاح (nested filter): " + sourceName);
         } catch (err2) {
-            console.log('تخطي الحذف أو حدث خطأ: ' + sourceName);
+            console.log("تخطي الحذف أو حدث خطأ: " + sourceName);
         }
     }
 }
@@ -89,39 +175,43 @@ async function embedChunksWithRetry(chunks, batchSize) {
         const batch = chunks.slice(i, i + batchSize);
         let success = false;
         let retries = 0;
+        
         while (!success) {
             try {
                 const url = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:batchEmbedContents?key=' + GEMINI_API_KEY;
                 const requests = batch.map(function(text) { return {
-                    model: 'models/gemini-embedding-2',
+                    model: 'models/gemini-embedding-2', 
                     content: { parts: [{ text: text }] },
                     outputDimensionality: 768
                 };});
+                
                 const res = await fetch(url, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ requests: requests })
                 });
+                
                 const data = await res.json();
+                
                 if (data.error) {
                     if (data.error.code === 429) {
-                        console.log('Rate limit ' + (retries + 1));
+                        console.log('تم حظر المعدل (429 Rate Limit)، ننتظر 60 ثانية... (محاولة ' + (retries + 1) + ')');
                         await delay(60000);
                         retries++;
                         continue;
                     }
                     throw new Error(data.error.message);
                 }
+                
                 if (!data.embeddings || data.embeddings.length !== batch.length) {
                     throw new Error('استجابة المتجهات غير صحيحة من جوجل.');
                 }
-                for (let j = 0; j < data.embeddings.length; j++) {
-                    allEmbeddings.push(data.embeddings[j].values);
-                }
+                
+                allEmbeddings.push(...data.embeddings.map(function(e){ return e.values; }));
                 success = true;
-                await delay(3000);
+                await delay(3000); // 3 seconds between batches
             } catch (err) {
-                console.error('Error embedding batch ' + i + ': ', err.message);
+                console.error("خطأ أثناء التضمين للدفعة " + i + ": ", err.message);
                 retries++;
                 if (retries > 3) throw err;
                 await delay(5000 * retries);
@@ -133,15 +223,18 @@ async function embedChunksWithRetry(chunks, batchSize) {
 
 async function processBook(filePath) {
     if (!fs.existsSync(filePath)) {
-        console.log('تخطي: الملف غير موجود محلياً: ' + filePath);
+        console.log("تخطي: الملف غير موجود محلياً: " + filePath);
         return;
     }
+
     const parts = filePath.split('/');
     let topicFolder = 'aqeedah';
     if (parts.length > 2 && parts[0] === 'test_sync') topicFolder = parts[2].toLowerCase();
     else if (parts.length > 1) topicFolder = parts[1].toLowerCase();
+
     const fileName = parts[parts.length - 1];
     const sourceName = fileName.replace(/\.[^/.]+$/, '');
+
     const topicMap = {
         'aqeedah': 'عقيدة',
         'tafsir': 'تفسير',
@@ -151,21 +244,29 @@ async function processBook(filePath) {
         'history': 'تاريخ'
     };
     const topic = topicMap[topicFolder] || 'عقيدة';
-    console.log('>> معالجة: ' + sourceName + ' (' + topic + ')');
+
+    console.log("\n📚 معالجة: " + sourceName + " (" + topic + ")");
+
+    // Ensure older segments are deleted first
     await deleteBookVectors(filePath);
+
     const rawContent = fs.readFileSync(filePath, 'utf8');
     const textContent = parseContent(filePath, rawContent);
     const chunks = chunkText(textContent);
+
     if (chunks.length === 0) {
-        console.log('تحذير: لا يوجد محتوى نصي لرفعه في ' + sourceName);
+        console.log("تحذير: لا يوجد محتوى نصي لرفعه في " + sourceName);
         return;
     }
-    console.log('>> تقسيم الكتاب لـ: ' + chunks.length + ' جزء. جاري إنشاء المتجهات...');
+
+    console.log(">> تقسيم الكتاب لـ: " + chunks.length + " جزء. جاري إنشاء المتجهات...");
     const valuesArray = await embedChunksWithRetry(chunks, 90);
-    console.log('>> جاري الرفع إلى Pinecone...');
+    
+    console.log(">> جاري الرفع إلى Pinecone...");
     for (let i = 0; i < chunks.length; i += 50) {
         const batchChunks = chunks.slice(i, i + 50);
         const batchValues = valuesArray.slice(i, i + 50);
+        
         try {
             const vectors = batchChunks.map(function(text, idx) {
                 const vectorId = crypto.createHash('md5').update(sourceName + '-' + (i + idx)).digest('hex');
@@ -180,22 +281,24 @@ async function processBook(filePath) {
                     }
                 };
             });
+
+            // Pinecone Upsert handling version differences
             try {
-                await index.upsert(vectors);
+                await index.upsert(vectors); // newest syntax
             } catch (err) {
                 if (err.message && err.message.includes('at least')) {
-                    await index.upsert({ records: vectors });
+                    await index.upsert({ records: vectors }); // older wrapper syntax
                 } else {
                     throw err;
                 }
             }
-            console.log('   تم رفع المتجهات ' + (i+1) + ' إلى ' + (i + batchChunks.length));
+            console.log("   تم رفع المتجهات " + (i+1) + " إلى " + (i + batchChunks.length));
         } catch (error) {
-            console.error('Error uploading ' + sourceName + ':', error.message);
-            process.exit(1);
+            console.error("خطأ خطير أثناء الرفع لدفعة " + sourceName + ":", error.message);
+            process.exit(1); 
         }
     }
-    console.log('✅ انتهت المزامنة بنجاح: ' + sourceName);
+    console.log("✅ انتهت المزامنة بنجاح: " + sourceName);
 }
 
 async function main() {
@@ -203,20 +306,22 @@ async function main() {
         console.log('لا يوجد شيء للقيام به.');
         return;
     }
-    for (let i = 0; i < deletedFiles.length; i++) {
-        if (deletedFiles[i] && deletedFiles[i].includes('books/')) {
-            await deleteBookVectors(deletedFiles[i]);
+
+    for (const file of deletedFiles) {
+        if (file.includes('books/')) {
+            // Need to make sure file isn't undefined
+            await deleteBookVectors(file);
         }
     }
-    for (let i = 0; i < filesToProcess.length; i++) {
-        const f = filesToProcess[i];
-        if (f && f.includes('books/') && (f.endsWith('.txt') || f.endsWith('.htm') || f.endsWith('.html'))) {
-            await processBook(f);
+
+    for (const file of filesToProcess) {
+        if (file && file.includes('books/') && (file.endsWith('.txt') || file.endsWith('.htm') || file.endsWith('.html'))) {
+            await processBook(file);
         }
     }
 }
 
 main().catch(function(error) {
-    console.error('❌ Error:', error);
+    console.error('❌ توقف السكربت بسبب خطأ غير متوقع:', error);
     process.exit(1);
 });
