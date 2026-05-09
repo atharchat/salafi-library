@@ -22,20 +22,29 @@ function parseFiles(envVar) {
     
     let cleaned = envVar.trim();
     
-    // Remove wrapping array brackets if present
     if (cleaned.startsWith('[') && cleaned.endsWith(']')) {
         cleaned = cleaned.substring(1, cleaned.length - 1);
     }
     
-    // Split by either comma or space
-    const list = cleaned.split(/[\s,]+/);
+    // Match quoted strings or non-space words
+    const list = cleaned.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
+    
     const parsed = list.map(function(f) {
         let s = f.trim();
-        // Handle single or double quotes wrapping the filename
         if ((s.startsWith("'") && s.endsWith("'")) || (s.startsWith('"') && s.endsWith('"'))) {
             s = s.substring(1, s.length - 1);
         }
-        return s;
+        
+        let bytes = [];
+        for (let i = 0; i < s.length; i++) {
+            if (s[i] === '\\' && i + 3 < s.length && /[0-7]{3}/.test(s.substring(i+1, i+4))) {
+                bytes.push(parseInt(s.substring(i+1, i+4), 8));
+                i += 3;
+            } else {
+                bytes.push(s.charCodeAt(i));
+            }
+        }
+        return Buffer.from(bytes).toString('utf8');
     }).filter(function(f) { return f !== ''; });
     
     return parsed;
@@ -56,10 +65,9 @@ function parseContent(filePath, content) {
     if (filePath.endsWith('.htm') || filePath.endsWith('.html')) {
         const $ = cheerio.load(content);
         
-        // 1. Remove footnotes completely
+        // مسح الهوامش والشروحات السفلية
         $('.footnote, .footnotes, .hashiya, .hasheya, .margnote, .notes, .commentary').remove();
         
-        // In Shamela, footnotes are often separated by an <hr width="95">
         $('div.PageText').each(function() {
             let foundHr = false;
             $(this).contents().each(function() {
@@ -74,12 +82,11 @@ function parseContent(filePath, content) {
         
         $('.PageHead').remove();
 
-        // 2. Remove Introductions and Indices
         let finalBlocks = [];
         let isSkipping = false;
         
         $('.PageText').each(function(index) {
-            if (index === 0) return; // Skip metadata page
+            if (index === 0) return; // تجاوز المجلد التعريفي الأول
 
             let titles = [];
             $(this).find('.title, [data-type="title"]').each(function() {
@@ -118,7 +125,7 @@ function parseContent(filePath, content) {
             
             if (!isSkipping) {
                 let text = $(this).text();
-                // some extra footnote cleanups: remove lines starting with = or regex matches 
+                // تنظيف بعض أرقام الهوامش والرموز المتداخلة 
                 text = text.replace(/\[\d+\]/g, ''); 
                 text = text.replace(/\(\d+\)/g, ''); 
                 text = text.replace(/^[([\s]*\d+[\s]*[)\]].*$/gm, '');
@@ -156,7 +163,6 @@ async function deleteBookVectors(filePath) {
         await index.deleteMany({ source: sourceName });
         console.log("تم الحذف بنجاح (direct filter): " + sourceName);
     } catch (error) {
-        // Fallback for older pinecone versions
         try {
             await index.deleteMany({ filter: { source: sourceName } });
             console.log("تم الحذف بنجاح (nested filter): " + sourceName);
@@ -209,7 +215,7 @@ async function embedChunksWithRetry(chunks, batchSize) {
                 
                 allEmbeddings.push(...data.embeddings.map(function(e){ return e.values; }));
                 success = true;
-                await delay(3000); // 3 seconds between batches
+                await delay(3000); 
             } catch (err) {
                 console.error("خطأ أثناء التضمين للدفعة " + i + ": ", err.message);
                 retries++;
@@ -247,12 +253,21 @@ async function processBook(filePath) {
 
     console.log("\n📚 معالجة: " + sourceName + " (" + topic + ")");
 
-    // Ensure older segments are deleted first
     await deleteBookVectors(filePath);
 
     const rawContent = fs.readFileSync(filePath, 'utf8');
     const textContent = parseContent(filePath, rawContent);
     const chunks = chunkText(textContent);
+
+    let arabicTitle = sourceName;
+    if (filePath.endsWith('.htm') || filePath.endsWith('.html')) {
+        const cheerio = require('cheerio');
+        const $ = cheerio.load(rawContent);
+        const parsedTitle = $('title').first().text().trim();
+        if (parsedTitle && parsedTitle.length > 0) {
+            arabicTitle = parsedTitle; // هنا نقوم باستخلاص العنوان الداخلي للكتاب باللغة العربية الصحيحة
+        }
+    }
 
     if (chunks.length === 0) {
         console.log("تحذير: لا يوجد محتوى نصي لرفعه في " + sourceName);
@@ -262,7 +277,7 @@ async function processBook(filePath) {
     console.log(">> تقسيم الكتاب لـ: " + chunks.length + " جزء. جاري إنشاء المتجهات...");
     const valuesArray = await embedChunksWithRetry(chunks, 90);
     
-    console.log(">> جاري الرفع إلى Pinecone...");
+    console.log(">> جاري الرفع إلى Pinecone المسمى: " + arabicTitle + "...");
     for (let i = 0; i < chunks.length; i += 50) {
         const batchChunks = chunks.slice(i, i + 50);
         const batchValues = valuesArray.slice(i, i + 50);
@@ -276,18 +291,18 @@ async function processBook(filePath) {
                     values: vals,
                     metadata: {
                         source: sourceName,
+                        book_title: arabicTitle,
                         topic: topic,
                         text: text
                     }
                 };
             });
 
-            // Pinecone Upsert handling version differences
             try {
-                await index.upsert(vectors); // newest syntax
+                await index.upsert(vectors);
             } catch (err) {
                 if (err.message && err.message.includes('at least')) {
-                    await index.upsert({ records: vectors }); // older wrapper syntax
+                    await index.upsert({ records: vectors });
                 } else {
                     throw err;
                 }
@@ -298,7 +313,7 @@ async function processBook(filePath) {
             process.exit(1); 
         }
     }
-    console.log("✅ انتهت المزامنة بنجاح: " + sourceName);
+    console.log("✅ انتهت المزامنة بنجاح: " + arabicTitle);
 }
 
 async function main() {
@@ -309,7 +324,6 @@ async function main() {
 
     for (const file of deletedFiles) {
         if (file.includes('books/')) {
-            // Need to make sure file isn't undefined
             await deleteBookVectors(file);
         }
     }
